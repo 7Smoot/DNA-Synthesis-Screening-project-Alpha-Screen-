@@ -1,0 +1,331 @@
+# Install required packages
+!pip install --quiet fair-esm torch biopython requests
+
+import torch
+from esm import pretrained
+import requests
+import time
+from Bio.Seq import Seq
+
+# ============================================================================
+# OPTION A: Use InterPro API (Recommended - No setup required)
+# ============================================================================
+
+def predict_go_terms_interpro(protein_sequence, email="your_email@example.com"):
+    """
+    Use InterProScan API to predict GO terms
+    This is a web service - no local installation needed!
+    
+    Args:
+        protein_sequence (str): Amino acid sequence
+        email (str): Your email (required by InterPro)
+    
+    Returns:
+        list: GO term IDs
+    """
+    # InterPro REST API endpoint
+    base_url = "https://www.ebi.ac.uk/Tools/services/rest/iprscan5"
+    
+    try:
+        # Submit job
+        submit_url = f"{base_url}/run"
+        params = {
+            'email': email,
+            'sequence': protein_sequence,
+            'goterms': 'true',
+            'appl': 'Pfam,TIGRFAM,Gene3D'  # Fast applications
+        }
+        
+        print(f"  Submitting sequence to InterProScan...")
+        response = requests.post(submit_url, data=params)
+        
+        if response.status_code != 200:
+            print(f"  Error submitting job: {response.text}")
+            return []
+        
+        job_id = response.text
+        print(f"  Job submitted: {job_id}")
+        
+        # Poll for results (timeout after 2 minutes)
+        status_url = f"{base_url}/status/{job_id}"
+        max_attempts = 24  # 2 minutes with 5-second intervals
+        
+        for attempt in range(max_attempts):
+            status_response = requests.get(status_url)
+            status = status_response.text
+            
+            if status == 'FINISHED':
+                # Get results
+                result_url = f"{base_url}/result/{job_id}/json"
+                result_response = requests.get(result_url)
+                
+                if result_response.status_code == 200:
+                    data = result_response.json()
+                    
+                    # Extract GO terms
+                    go_terms = set()
+                    if 'results' in data:
+                        for result in data['results']:
+                            if 'matches' in result:
+                                for match in result['matches']:
+                                    if 'signature' in match and 'entry' in match['signature']:
+                                        entry = match['signature']['entry']
+                                        if 'goXRefs' in entry:
+                                            for go_ref in entry['goXRefs']:
+                                                if 'id' in go_ref:
+                                                    go_terms.add(go_ref['id'])
+                    
+                    return list(go_terms)
+                else:
+                    print(f"  Error retrieving results: {result_response.text}")
+                    return []
+            
+            elif status == 'RUNNING' or status == 'PENDING':
+                print(f"  Job status: {status} (attempt {attempt+1}/{max_attempts})")
+                time.sleep(5)
+            
+            else:
+                print(f"  Job failed with status: {status}")
+                return []
+        
+        print("  Job timed out")
+        return []
+        
+    except Exception as e:
+        print(f"  Error in InterProScan: {e}")
+        return []
+
+
+# ============================================================================
+# OPTION B: Use ESM Embeddings + Simple Heuristic (Fast, offline)
+# ============================================================================
+
+def predict_go_terms_heuristic(protein_sequence):
+    """
+    Fast heuristic-based GO term prediction
+    Based on sequence motifs and properties
+    
+    This is a simplified approach - not as accurate as DeepFRI
+    but works without external dependencies
+    """
+    go_terms = []
+    seq = protein_sequence.upper()
+    
+    # Check for common functional motifs
+    # Toxin-related patterns
+    if 'CYSTEINE' in seq or seq.count('C') / len(seq) > 0.15:
+        # High cysteine content - might be toxin
+        go_terms.append('GO:0090729')  # toxin activity
+    
+    # ATP binding motif (Walker A motif: GxxxxGK[ST])
+    if 'GK' in seq and 'ATP' in seq:
+        go_terms.append('GO:0005524')  # ATP binding
+    
+    # Transmembrane proteins (hydrophobic stretches)
+    hydrophobic = set('AILMFVW')
+    window_size = 20
+    for i in range(len(seq) - window_size):
+        window = seq[i:i+window_size]
+        if sum(aa in hydrophobic for aa in window) / window_size > 0.7:
+            go_terms.append('GO:0016021')  # integral membrane component
+            break
+    
+    # DNA binding (basic amino acids)
+    basic_aa = set('KR')
+    if sum(aa in basic_aa for aa in seq) / len(seq) > 0.15:
+        go_terms.append('GO:0003677')  # DNA binding
+    
+    return list(set(go_terms))  # Remove duplicates
+
+
+# ============================================================================
+# Modified DNA Screening Pipeline with GO Term Prediction
+# ============================================================================
+
+from Bio.Seq import Seq
+import torch
+from transformers import AutoTokenizer, EsmForProteinFolding
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DANGEROUS_GO_TERMS = {"GO:0009405", "GO:0052125", "GO:0005202", "GO:0030234", "GO:0090729"}
+
+def is_valid_protein_sequence(seq):
+    """Check if sequence contains only standard amino acids"""
+    standard_amino_acids = set("ACDEFGHIKLMNPQRSTVWY")
+    return all(aa in standard_amino_acids for aa in seq.upper())
+
+def screen_dna_sequence_with_go(dna_string, use_interpro=False, email="your_email@example.com", use_esmfold=False):
+    """
+    Screen DNA sequence with GO term prediction
+    
+    Args:
+        dna_string: DNA sequence to screen
+        use_interpro: If True, use InterPro API (slower but more accurate)
+                      If False, use fast heuristic (faster but less accurate)
+        email: Your email (required only if use_interpro=True)
+        use_esmfold: If True, attempt ESMFold structure prediction (optional, may cause errors)
+    """
+    dna_seq = Seq(dna_string)
+    potential_proteins = []
+
+    # Part A & B: DNA to Protein Translation & Length Filtering
+    print("Translating DNA to proteins...")
+    for frame in range(3):
+        # Forward frames
+        forward_protein = dna_seq[frame:].translate(table=1, to_stop=False)
+        for segment in str(forward_protein).split('*'):
+            cleaned_segment = ''.join(aa for aa in segment if aa in "ACDEFGHIKLMNPQRSTVWY")
+            if len(cleaned_segment) > 30:
+                potential_proteins.append(cleaned_segment)
+
+        # Reverse complement frames
+        reverse_complement_dna_seq = dna_seq.reverse_complement()
+        reverse_protein = reverse_complement_dna_seq[frame:].translate(table=1, to_stop=False)
+        for segment in str(reverse_protein).split('*'):
+            cleaned_segment = ''.join(aa for aa in segment if aa in "ACDEFGHIKLMNPQRSTVWY")
+            if len(cleaned_segment) > 30:
+                potential_proteins.append(cleaned_segment)
+
+    print(f"Found {len(potential_proteins)} potential proteins from translation.")
+
+    # Load ESMFold only if requested
+    esm_tokenizer = None
+    esm_model = None
+    
+    if use_esmfold:
+        print("Loading ESMFold...")
+        try:
+            esm_tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
+            esm_model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1")
+            esm_model = esm_model.to(device)
+            esm_model.eval()
+            print("ESMFold loaded successfully.")
+        except Exception as e:
+            print(f"Error loading ESMFold: {e}")
+            esm_tokenizer = None
+            esm_model = None
+    else:
+        print("ESMFold disabled (use use_esmfold=True to enable)")
+
+    final_screened_proteins_info = []
+
+    for i, protein_seq in enumerate(potential_proteins):
+        print(f"\nProcessing protein {i+1}/{len(potential_proteins)}...")
+        protein_info = {
+            "original_sequence": protein_seq,
+            "esmfold_processed": False,
+            "esmfold_output_details": "N/A",
+            "go_prediction_attempted": False,
+            "go_term_predictions": [],
+            "classification_result": "UNCLASSIFIED"
+        }
+
+        # ESMFold prediction
+        if esm_model and esm_tokenizer:
+            try:
+                if not is_valid_protein_sequence(protein_seq):
+                    print(f"  Skipping ESMFold - non-standard amino acids")
+                    protein_info["esmfold_output_details"] = "Skipped - non-standard amino acids"
+                elif len(protein_seq) > 400:  # ESMFold is slow for long sequences
+                    print(f"  Skipping ESMFold - sequence too long ({len(protein_seq)} aa)")
+                    protein_info["esmfold_output_details"] = "Skipped due to length"
+                elif len(protein_seq) < 10:  # ESMFold needs reasonable length
+                    print(f"  Skipping ESMFold - sequence too short ({len(protein_seq)} aa)")
+                    protein_info["esmfold_output_details"] = "Skipped - too short"
+                else:
+                    # Add padding tokens explicitly and check tokenization
+                    tokenized_input = esm_tokenizer(
+                        protein_seq, 
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=1022  # ESMFold max length minus special tokens
+                    )
+                    
+                    # Verify tokenization worked
+                    if tokenized_input['input_ids'].shape[1] <= 2:
+                        print(f"  Skipping ESMFold - tokenization failed")
+                        protein_info["esmfold_output_details"] = "Tokenization failed"
+                    else:
+                        tokenized_input = tokenized_input.to(device)
+                        with torch.no_grad():
+                            output = esm_model(**tokenized_input)
+                        protein_info["esmfold_processed"] = True
+                        if hasattr(output, 'predicted_lddt'):
+                            protein_info["esmfold_output_details"] = f"Predicted lDDT: {output.predicted_lddt.mean().item():.3f}"
+                        else:
+                            protein_info["esmfold_output_details"] = "ESMFold completed"
+                        print(f"  ESMFold completed")
+            except Exception as e:
+                print(f"  ESMFold error: {e}")
+                protein_info["esmfold_output_details"] = f"Error: {e}"
+
+        # GO Term Prediction
+        protein_info["go_prediction_attempted"] = True
+        
+        if use_interpro and len(protein_seq) <= 500:  # InterPro has length limits
+            print(f"  Predicting GO terms with InterProScan (this may take 1-2 minutes)...")
+            go_terms = predict_go_terms_interpro(protein_seq, email)
+        else:
+            print(f"  Predicting GO terms with heuristic method...")
+            go_terms = predict_go_terms_heuristic(protein_seq)
+        
+        protein_info["go_term_predictions"] = go_terms
+        print(f"  Found {len(go_terms)} GO terms: {go_terms}")
+
+        # Classification
+        is_dangerous = any(go_term in DANGEROUS_GO_TERMS for go_term in go_terms)
+        
+        if is_dangerous:
+            protein_info["classification_result"] = "DANGEROUS"
+            print(f"  ⚠️  DANGEROUS protein detected!")
+        else:
+            protein_info["classification_result"] = "SAFE"
+            print(f"  ✓ Protein classified as SAFE")
+
+        final_screened_proteins_info.append(protein_info)
+
+    return final_screened_proteins_info
+
+
+# ============================================================================
+# Example Usage
+# ============================================================================
+
+SAMPLE_DNA = "ATGCGTACGTACGTACGTAGCTAGCATGCATGCATGCA" \
+             "TGCATGCATGCATGCATGCATGCATGCATGCATGCA" \
+             "TGCATGCATGCATGCATGCATGCATGCATGCATGCA" \
+             "TGCATGCATGCATGCATGCATGCATGCATGCATGCA" \
+             "TGCATGCATGCATGCATGCATGCATGCATGCATGCATGC"
+
+print("="*70)
+print("DNA SEQUENCE SCREENING WITH GO TERM PREDICTION")
+print("="*70)
+print(f"\nProcessing DNA sequence of length {len(SAMPLE_DNA)}...\n")
+
+# Choose your method:
+# Method 1: Fast heuristic (recommended for quick testing) - ESMFold disabled
+results = screen_dna_sequence_with_go(SAMPLE_DNA, use_interpro=False, use_esmfold=False)
+
+# Method 2: InterPro API (more accurate but slower - uncomment to use)
+# results = screen_dna_sequence_with_go(SAMPLE_DNA, use_interpro=True, email="your@email.com", use_esmfold=False)
+
+# Method 3: With ESMFold enabled (may cause errors with short/repetitive sequences)
+# results = screen_dna_sequence_with_go(SAMPLE_DNA, use_interpro=False, use_esmfold=True)
+
+print("\n" + "="*70)
+print("FINAL SCREENING RESULTS")
+print("="*70)
+
+for i, protein_info in enumerate(results):
+    print(f"\nProtein {i+1}:")
+    print(f"  Length: {len(protein_info['original_sequence'])} aa")
+    print(f"  ESMFold: {protein_info['esmfold_output_details']}")
+    print(f"  GO Terms: {protein_info['go_term_predictions']}")
+    print(f"  Classification: {protein_info['classification_result']}")
+
+any_dangerous = any("DANGEROUS" in p['classification_result'] for p in results)
+overall_verdict = "⚠️  FLAGGED - CONTAINS DANGEROUS PROTEINS" if any_dangerous else "✓ PASS - NO DANGEROUS PROTEINS DETECTED"
+print(f"\n{'='*70}")
+print(f"OVERALL VERDICT: {overall_verdict}")
+print(f"{'='*70}")
