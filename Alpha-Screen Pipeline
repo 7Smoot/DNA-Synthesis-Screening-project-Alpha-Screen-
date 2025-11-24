@@ -7,9 +7,7 @@ import requests
 import time
 from Bio.Seq import Seq
 
-# ============================================================================
-# OPTION A: Use InterPro API (Recommended - No setup required)
-# ============================================================================
+# Using InterPro API
 
 def predict_go_terms_interpro(protein_sequence, email="your_email@example.com"):
     """
@@ -96,9 +94,7 @@ def predict_go_terms_interpro(protein_sequence, email="your_email@example.com"):
         return []
 
 
-# ============================================================================
-# OPTION B: Use ESM Embeddings + Simple Heuristic (Fast, offline)
-# ============================================================================
+# OPTION B: Use ESM Embeddings + Simple Heuristic (faster)
 
 def predict_go_terms_heuristic(protein_sequence):
     """
@@ -138,9 +134,7 @@ def predict_go_terms_heuristic(protein_sequence):
     return list(set(go_terms))  # Remove duplicates
 
 
-# ============================================================================
 # Modified DNA Screening Pipeline with GO Term Prediction
-# ============================================================================
 
 from Bio.Seq import Seq
 import torch
@@ -288,9 +282,7 @@ def screen_dna_sequence_with_go(dna_string, use_interpro=False, email="your_emai
     return final_screened_proteins_info
 
 
-# ============================================================================
 # Example Usage
-# ============================================================================
 
 SAMPLE_DNA = "ATGCGTACGTACGTACGTAGCTAGCATGCATGCATGCA" \
              "TGCATGCATGCATGCATGCATGCATGCATGCATGCA" \
